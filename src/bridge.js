@@ -919,11 +919,19 @@ function loadConfig() {
 
   // 思考强度可能被手工改成非法值（config.json 是用户可编辑的）。DeepSeek 适配器对非法值
   // 会硬拒绝，若直接透传会让每个会话的 selectModel 每次都失败；这里统一规范化并告警。
-  try {
-    cfg.dsh.reasoningEffort = normalizeReasoningEffort(cfg.dsh.reasoningEffort ?? REASONING_EFFORT_DEFAULT);
-  } catch (error) {
-    log(`⚠️ config.json 的 dsh.reasoningEffort「${cfg.dsh.reasoningEffort}」非法，已回退 ${REASONING_EFFORT_DEFAULT}（${error?.message ?? error}）`);
-    cfg.dsh.reasoningEffort = REASONING_EFFORT_DEFAULT;
+  //
+  // 空串是**有意义的**：表示「不指定强度」，由 DSH 侧按 provider 自己声明的默认档位决定。
+  // 不同 provider 的档位命名并不通用（space-bunny-free 用 light/balanced/deep，
+  // DeepSeek 系用 low/high/max），所以把值写死反而会让不支持的模型每次建会话都失败。
+  if (typeof cfg.dsh.reasoningEffort === 'string' && cfg.dsh.reasoningEffort.trim() === '') {
+    cfg.dsh.reasoningEffort = '';
+  } else {
+    try {
+      cfg.dsh.reasoningEffort = normalizeReasoningEffort(cfg.dsh.reasoningEffort ?? REASONING_EFFORT_DEFAULT);
+    } catch (error) {
+      log(`⚠️ config.json 的 dsh.reasoningEffort「${cfg.dsh.reasoningEffort}」非法，已回退 ${REASONING_EFFORT_DEFAULT}（${error?.message ?? error}）`);
+      cfg.dsh.reasoningEffort = REASONING_EFFORT_DEFAULT;
+    }
   }
 
   // 人格卡注入上限（字符）。历史硬编码 6000，现在可配：每条约 4~6k token 的成本护栏。
@@ -3896,10 +3904,12 @@ async function main() {
           sendJson({
             provider,
             model,
-            reasoningEffort: String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT),
+            // 未指定强度时展示 DSH 侧声明的 provider 默认档位，而不是内置的 max ——
+            // 不同 provider 的档位命名不同（space-bunny-free 是 light/balanced/deep）。
+            reasoningEffort: String(cfg.dsh?.reasoningEffort || providerDefault || REASONING_EFFORT_DEFAULT),
             options,
             labels,
-            default: REASONING_EFFORT_DEFAULT,
+            default: String(providerDefault || REASONING_EFFORT_DEFAULT),
             providerDefault,
             catalogSource,
             // selectModel 会同时写会话级与 DSH 全局默认（~/.dsh/settings.yaml 的 agent-default-model），
@@ -7531,11 +7541,25 @@ async function main() {
     if (modelAppliedSessions.get(sessionId) === modelSelectionEpoch) return 'applied';
     const provider = String(cfg.dsh?.provider || 'deepseek-official');
     const model = String(cfg.dsh?.model || 'deepseek-flash');
-    const effort = String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT);
+    // reasoningEffort 留空 = 「不指定」，让 DSH 用它自己声明的默认值。
+    //
+    // 为什么要区分「留空」和「非法」：不同 provider 的 effort 档位命名并不通用
+    // （例如 space-bunny-free 用 light/balanced/deep，而 DeepSeek 系用 low/high/max）。
+    // 原来的 `|| REASONING_EFFORT_DEFAULT` 把空串也当成未设置，于是无论用户怎么配
+    // 都会强制回退到 max —— 对不支持 max 的模型就是每次建会话都失败两次重试。
+    // 因此只有当配置了一个**明确非法**的值时才回退；留空则原样省略该字段。
+    const rawEffort = typeof cfg.dsh?.reasoningEffort === 'string' ? cfg.dsh.reasoningEffort.trim() : '';
+    let effort;
+    if (rawEffort !== '') {
+      // 配了才校验；配错早在配置加载阶段就会告警并回退，这里再兜一层。
+      try { effort = normalizeReasoningEffort(rawEffort); } catch { effort = undefined; }
+    }
     let lastError = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        const result = unwrap(await api.sessions.selectModel({ sessionId, provider, model, reasoningEffort: effort }), 'session.selectModel');
+        const request = { sessionId, provider, model };
+        if (effort) request.reasoningEffort = effort;
+        const result = unwrap(await api.sessions.selectModel(request), 'session.selectModel');
         modelAppliedSessions.set(sessionId, modelSelectionEpoch);
         log(`已设置会话模型 ${sessionId} -> ${result.selected.provider}/${result.selected.model} (${result.selected.reasoningEffort ?? '默认'})`);
         return 'applied';
