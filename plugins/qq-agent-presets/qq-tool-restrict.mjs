@@ -160,10 +160,15 @@ export const RESTRICTED_TOOL_NAMES = Object.freeze([...KNOWN_DANGEROUS_GLOBAL_TO
 
 // 执行期白名单：不在这些范围内的工具一律拒绝。
 // 前缀覆盖 DSH MCP client 暴露的命名空间工具。
+//
+// mcp__qq-lore__ 是资料库读写（只碰 roles/lore/*.md，写入还需 owner 校验），
+// 见 src/mcp-lore.js 顶部的不变量说明。它**不是**通用文件工具：不能碰 config/preset/src/人设卡。
+// 需要 owner 的完整工具面时用 closed-agent 模式，不要往这里加前缀。
 const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  'mcp__qq-lore__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，

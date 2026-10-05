@@ -12,6 +12,14 @@
   "role": {
     "maxInjectChars": 6000
   },
+  "lore": {
+    "topic": "",
+    "sources": [],
+    "scope": "",
+    "exclude": "",
+    "maxFileKb": 64,
+    "keepSnapshots": 3
+  },
   "snowluma": {
     "wsUrl": "ws://127.0.0.1:3001",
     "httpUrl": "http://127.0.0.1:3000",
