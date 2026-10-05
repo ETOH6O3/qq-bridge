@@ -9997,7 +9997,16 @@ async function main() {
       }
       if (plainContent === '/role' || plainContent.startsWith('/role ')) {
         const name = sanitizeRoleName(plainContent.slice(5).trim());
-        if (!name || name === 'off' || name === 'clear') {
+        if (!name) {
+          // 空参数 = 查询当前角色，不是清除。
+          // 早先这里把空参数也当作清除，实测「/role」会直接把人设清掉——
+          // 而 /role 的常规用法恰恰是「看一眼现在是哪个」。
+          // 清除必须显式：/role off 或 /role clear。
+          const rs = readRoleState();
+          await sendToQQ(key, `当前角色：${rs.role ?? '无（正常人格）'}；模式：${rs.mode}`);
+          return;
+        }
+        if (name === 'off' || name === 'clear') {
           writeRoleState(null, roleState.mode);
           await sendToQQ(key, '已清除角色，恢复正常人格。');
         } else {
