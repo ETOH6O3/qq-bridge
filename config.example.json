@@ -118,6 +118,13 @@
     "autoReplyCheckMs": 30000,
     "agentPreset": "qq-chat-v2",
     "provideRecommendations": true,
+    "mirrorOwnerOutput": {
+      "enabled": false,
+      "target": "",
+      "onlyWhenNoToolSend": true,
+      "prefix": "【AI 输出】",
+      "maxChars": 1000
+    },
     "tools": {
       "getPrompt": true,
       "getUnread": true,

@@ -821,6 +821,23 @@ function loadConfig() {
         wakeRecentLimit: 4,
         wakeMaxChars: 6000
       },
+      // 把 AI 在 Harness 里的**最终文本输出**同步给管理员私聊。
+      //
+      // 为什么要这个：reserved2 下 AI 的文本输出只是「思考」，正常路径不发送——
+      // 它该不该说话由 MCP 发送工具决定。但这也意味着「AI 想说话却忘了调工具」
+      // 时，管理员在 QQ 侧什么都看不到，只能去翻 state/bridge.log。
+      // 这个开关由**桥接自己**补发，不依赖提示词让 AI 自觉汇报。
+      //
+      // 防重：本轮若已通过发送类工具成功发出消息（sendToolSucceeded），则不再补发。
+      // 防环：只发给 owner 私聊，且机器人自己发的消息在 onPrivateMessage 就被丢弃，
+      //       不会回灌成新来信（见 bot.onPrivateMessage 的 self_id 过滤）。
+      mirrorOwnerOutput: {
+        enabled: false,            // 总开关（默认关：避免一开始就改变现有行为）
+        target: '',                // 目标会话 key；留空 = 自动取 owner 私聊 private:<ownerQQ>
+        onlyWhenNoToolSend: true,  // 本轮已用工具发过就不补发，避免重复
+        prefix: '【AI 输出】',      // 补发前缀，便于管理员区分「补发」与「AI 主动发言」
+        maxChars: 1000             // 补发正文上限（超出截断并标注）
+      },
       ...(file.socialV2 ?? {})
     }
   };
@@ -859,6 +876,18 @@ function loadConfig() {
     getSelfImage: true,
     sendVoice: false,
     ...(cfg.socialV2.tools ?? {})
+  };
+
+  // socialV2.mirrorOwnerOutput 需要深度合并：旧 config.json 里可能只写了
+  // `{ enabled: true }`，若用外层浅 spread，prefix/maxChars/onlyWhenNoToolSend
+  // 这些默认值会被整个丢掉。
+  cfg.socialV2.mirrorOwnerOutput = {
+    enabled: false,
+    target: '',
+    onlyWhenNoToolSend: true,
+    prefix: '【AI 输出】',
+    maxChars: 1000,
+    ...(cfg.socialV2.mirrorOwnerOutput ?? {})
   };
 
   // socialV2.voice：语音发送（把准备好的音频文件当 QQ 语音发出去）。
@@ -9261,6 +9290,66 @@ async function main() {
     saveSocialV2State();
   }
 
+  /**
+   * 把 AI 在 Harness 里的最终文本输出同步给管理员私聊。
+   *
+   * 背景：reserved2 下 AI 的文本输出只是「思考」，正常不发给 QQ —— 该不该说话由
+   * MCP 发送工具决定。但如果 AI 想说话却漏调工具（或工具调用失败），管理员在 QQ 侧
+   * 什么都看不到，只能去翻 state/bridge.log。这里由**桥接自己**补发，不依赖提示词。
+   *
+   * 三条安全保障：
+   *   1. 只发 owner 私聊（target 留空时自动取 private:<ownerQQ>），绝不发群/发他人 ——
+   *      避免把内部思考泄漏出去。
+   *   2. 机器人自己发的消息在 onPrivateMessage 就被 self_id 过滤丢弃，不会回灌成
+   *      新来信，因此不存在「补发→唤醒→再补发」的死循环。
+   *   3. 补发前走 auditAndSend 的敏感信息审计，令牌/路径不会漏出去。
+   *
+   * @returns {Promise<boolean>} 是否真的补发了
+   */
+  async function mirrorOwnerOutputV2(key, text, { sendToolSucceeded = false } = {}) {
+    const conf = cfg.socialV2?.mirrorOwnerOutput ?? {};
+    if (conf.enabled !== true) return false;
+    const ownerKey = `private:${String(cfg.ownerQQ ?? '')}`;
+    const target = String(conf.target || ownerKey).trim();
+    // 硬约束：只允许发给 owner 私聊。配置写错（比如填了群号）时拒绝并记日志，
+    // 绝不能把 AI 的内部输出发到群里去。
+    if (target !== ownerKey) {
+      log(`⚠️ mirrorOwnerOutput.target="${target}" 不是 owner 私聊（${ownerKey}），已拒绝补发`);
+      return false;
+    }
+    // 只镜像与 owner 的这条会话，别把别的会话的输出串进来。
+    if (key !== ownerKey) return false;
+    if (conf.onlyWhenNoToolSend !== false && sendToolSucceeded) {
+      log(`[reserved2] 本轮已用工具发送，跳过输出镜像 (${key})`);
+      return false;
+    }
+    const body = String(text ?? '').trim();
+    if (!body) return false;
+    // 清掉模型原始输出里混进来的工具调用标记（`<tool_calls>` 之类）。
+    // 实测：发送工具被禁用时，模型会把工具调用意图写成 XML 文本，于是镜像出去的
+    // 正文变成一堆 `<tool_calls>` 标签加半句话 —— 管理员看到的是脏内容。
+    // 这里只做「去掉标记」不做语义改写：真正的正文原样保留。
+    const cleaned = body
+      .replace(/<\/?tool_calls?>/gi, ' ')
+      .replace(/<\/?tool_call>/gi, ' ')
+      .replace(/<\/?(?:function_calls?|invoke|parameter)[^>]*>/gi, ' ')
+      .replace(/[ \t]{2,}/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    if (!cleaned) return false;
+    const maxChars = Math.max(1, Number(conf.maxChars) || 1000);
+    const clipped = cleaned.length > maxChars ? `${cleaned.slice(0, maxChars)}…（已截断，共 ${cleaned.length} 字）` : cleaned;
+    const prefix = typeof conf.prefix === 'string' ? conf.prefix : '';
+    const outbound = `${prefix}${clipped}`;
+    // 复用统一出站口：内含敏感信息审计 + 分条发送。
+    const sent = await auditAndSend(target, outbound);
+    if (sent) {
+      log(`[reserved2] AI 输出已镜像到管理员私聊 (${target})：${clipped.slice(0, 60)}${clipped.length > 60 ? '…' : ''}`);
+      appendActivity(`${target} [reserved2] AI 输出镜像：${clipped.slice(0, 80)}${clipped.length > 80 ? '…' : ''}`);
+    }
+    return sent;
+  }
+
   function readFeedbackEntries() {
     const data = readJsonSafe(FEEDBACK_FILE, []);
     return Array.isArray(data) ? data : [];
@@ -10713,6 +10802,9 @@ async function main() {
                 } else if (currentMode === 'reserved2') {
                   log(`[reserved2] AI 内部输出（不自动转发）(${key}): ${plain.slice(0, 80)}`);
                   appendActivity(`${key} [reserved2] AI 内部输出：${plain.slice(0, 80)}${plain.length > 80 ? '…' : ''}`);
+                  // 由桥接自己把最终输出同步给管理员私聊（不依赖提示词让 AI 自觉汇报）。
+                  // 默认关闭；本轮已用发送工具发过时不重复补发（onlyWhenNoToolSend）。
+                  await mirrorOwnerOutputV2(key, plain, { sendToolSucceeded });
                 } else {
                   if (shouldBlockSilentReply(key)) {
                     log(`静默模式，拦截在途回复 (${key})`);
