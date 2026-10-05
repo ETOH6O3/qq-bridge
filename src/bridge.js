@@ -5755,15 +5755,6 @@ async function main() {
           const maxMs = Math.max(minMs, Number(waitCfg.maxMs) || 600000);
           const timeoutMs = Math.min(maxMs, Math.max(minMs, Math.round(Number(body.timeoutMs) || defaultMs)));
           const st = getSocialV2State(key);
-          // 同一会话只允许一个长轮询等待，避免并发挂起耗尽 HTTP handler。
-          // 租约过期则视为残留（handler 异常退出没清干净），允许接管而不是永久 429。
-          if (activeWaits.has(key) && Date.now() - activeWaits.get(key) < ACTIVE_WAIT_LEASE_MS) {
-            sendJson({ ok: false, error: '该会话已有一个等待中的 qq_wait_for_messages，请等待它结束' }, 429);
-            return;
-          }
-          activeWaits.set(key, Date.now());
-          const finishWait = () => activeWaits.delete(key);
-          req.on('close', finishWait);
           const minQuietAfterNewMs = Number.isFinite(Number(waitCfg.minQuietAfterNewMs)) ? Math.max(0, Number(waitCfg.minQuietAfterNewMs)) : 10000;
           const suggestedQuietMs = Math.max(suggestQuietMsV2(st), minQuietAfterNewMs);
           const rawQuietMs = body.quietMs != null ? Number(body.quietMs) : suggestedQuietMs;
@@ -5772,6 +5763,37 @@ async function main() {
           // 同时给 quietMs 加上限，避免被模型/群友诱导导致 HTTP handler 长时间挂起。
           const maxQuietMs = Math.max(minQuietAfterNewMs, Math.min(120000, Number(waitCfg.maxMs) || 600000));
           const quietMs = Math.min(maxQuietMs, Math.max(minQuietAfterNewMs, Math.round(rawQuietMs) || 0));
+          // ── 同一会话只允许一个长轮询等待 ──────────────────────────────────
+          // 为什么要租约 + 定时器兜底：`finishWait` 只在正常返回和权限变化两条路径被调用，
+          // 中间任何一步抛异常（saveSocialV2State 写盘失败、socket 已关闭时 sendJson…）
+          // 都会直接跳到 handler 的兜底 catch —— 那里不碰 activeWaits，锁就泄漏了。
+          // 泄漏后该会话的 qq_wait_for_messages 全部 429，直到租约到点。
+          //
+          // 旧实现的问题不止泄漏：租约是固定 15 分钟，而一次 300000 预算的合法等待
+          // 最长只跑约 7 分钟，剩下 8 分钟里 AI 每次重试都只拿到 429、且不知道还要等多久，
+          // 表现就是「等待锁卡死」。现在租约按**本次请求自己的预算**算，泄漏也能很快自愈。
+          const leaseMs = Math.min(20 * 60 * 1000, timeoutMs + maxQuietMs + 15000);
+          const held = activeWaits.get(key);
+          const heldLeaseMs = held?.leaseMs ?? ACTIVE_WAIT_LEASE_MS;
+          if (held !== undefined && Date.now() - held.at < heldLeaseMs) {
+            const remainSec = Math.ceil((heldLeaseMs - (Date.now() - held.at)) / 1000);
+            sendJson({ ok: false, error: `该会话已有一个等待中的 qq_wait_for_messages，请等待它结束（剩余约 ${remainSec} 秒；若这是上一次异常退出留下的残留，租约到点后自动放行）` }, 429);
+            return;
+          }
+          let leaseTimer = null;
+          const waitToken = {};
+          const finishWait = () => {
+            if (leaseTimer) { clearTimeout(leaseTimer); leaseTimer = null; }
+            // 只清掉自己持有的那把锁：异常路径可能已经被后继请求接管，
+            // 无条件 delete 会把新持有者的锁误删（旧实现用 15 分钟长租约来掩盖这点）。
+            if (activeWaits.get(key)?.token === waitToken) activeWaits.delete(key);
+          };
+          const waitLease = { token: waitToken, leaseMs, at: Date.now() };
+          activeWaits.set(key, waitLease);
+          leaseTimer = setTimeout(() => { activeWaits.delete(key); }, leaseMs);
+          leaseTimer.unref?.();
+          req.on('close', finishWait);
+          try {
           if (st.pendingWakeTimer) {
             clearTimeout(st.pendingWakeTimer);
             st.pendingWakeTimer = null;
@@ -5905,6 +5927,11 @@ async function main() {
             unreadCount: st.unread.length
           });
           return;
+          } finally {
+            // try/finally 是这次修复的核心：无论正常返回、提前 return，还是中途抛异常，
+            // 锁都一定被释放。旧实现只在正常路径清锁，异常时泄漏到租约到点。
+            finishWait();
+          }
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/check-send') {
           const body = await readBody();
